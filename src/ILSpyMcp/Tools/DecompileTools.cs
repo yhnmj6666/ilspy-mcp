@@ -25,6 +25,23 @@ public sealed class DecompileTools
         }
     }
 
+    [McpServerTool(Name = "decompile_member"), Description("Decompile a specific member (method, property, field, or event) from a .NET type to C# source code. Useful for inspecting a single function without decompiling the entire type.")]
+    public static string DecompileMember(
+        DecompilerService decompilerService,
+        [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,
+        [Description("Fully qualified type name (e.g. 'MyNamespace.MyClass')")] string typeName,
+        [Description("Member name (e.g. 'ToString', 'Count', 'MyMethod'). For overloaded methods, all overloads are returned.")] string memberName)
+    {
+        try
+        {
+            return decompilerService.DecompileMember(assemblyPath, typeName, memberName);
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
     [McpServerTool(Name = "decompile_assembly"), Description("Decompile an entire .NET assembly to C# source code. Warning: output may be very large for big assemblies.")]
     public static string DecompileAssembly(
         DecompilerService decompilerService,
