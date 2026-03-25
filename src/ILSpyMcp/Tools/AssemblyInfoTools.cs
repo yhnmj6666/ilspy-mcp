@@ -10,7 +10,7 @@ namespace ILSpyMcp.Tools;
 [McpServerToolType]
 public sealed class AssemblyInfoTools
 {
-    [McpServerTool(Name = "get_assembly_info"), Description("Get metadata information about a .NET assembly including name, version, strong name, target framework, and referenced assemblies with their resolution status.")]
+    [McpServerTool(Name = "get_assembly_info", Title = "Get Assembly Info", ReadOnly = true, OpenWorld = false), Description("Get metadata information about a .NET assembly including name, version, strong name, target framework, and referenced assemblies with their resolution status.")]
     public static string GetAssemblyInfo(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath)

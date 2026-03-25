@@ -1,5 +1,5 @@
 using System.ComponentModel;
-using System.Text;
+using System.Text.Json;
 
 using ILSpyMcp.Services;
 
@@ -10,34 +10,30 @@ namespace ILSpyMcp.Tools;
 [McpServerToolType]
 public sealed class SearchPathTools
 {
-    [McpServerTool(Name = "get_search_paths"), Description("Get the configured assembly search paths used for dependency resolution and cross-assembly searches.")]
+    private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = true };
+
+    [McpServerTool(Name = "get_search_paths", Title = "Get Search Paths", ReadOnly = true, OpenWorld = false), Description("Get the configured assembly search paths used for dependency resolution and cross-assembly searches. Returns a JSON array.")]
     public static string GetSearchPaths(DecompilerService decompilerService)
     {
         var paths = decompilerService.SearchPaths;
         if (paths.Count == 0)
             return "No search paths configured. Use set_search_paths to add directories containing .NET assemblies.";
 
-        var sb = new StringBuilder();
-        sb.AppendLine($"Configured search paths ({paths.Count}):");
-        sb.AppendLine();
-        foreach (var path in paths)
+        var result = paths.Select(path =>
         {
-            sb.Append($"  {path}");
             if (Directory.Exists(path))
             {
                 var dlls = Directory.GetFiles(path, "*.dll").Length;
                 var exes = Directory.GetFiles(path, "*.exe").Length;
-                sb.AppendLine($"  ({dlls} .dll, {exes} .exe)");
+                return new { Path = path, DllCount = dlls, ExeCount = exes, Exists = true };
             }
-            else
-            {
-                sb.AppendLine("  (directory not found)");
-            }
-        }
-        return sb.ToString();
+            return new { Path = path, DllCount = 0, ExeCount = 0, Exists = false };
+        });
+
+        return JsonSerializer.Serialize(result, s_jsonOptions);
     }
 
-    [McpServerTool(Name = "set_search_paths"), Description("Set the assembly search paths. These directories are used to resolve dependencies during decompilation and to search across assemblies (e.g. find_implementations). Replaces any previously configured paths. Pass an empty array to clear.")]
+    [McpServerTool(Name = "set_search_paths", Title = "Set Search Paths", Destructive = false, Idempotent = true, OpenWorld = false), Description("Set the assembly search paths. These directories are used to resolve dependencies during decompilation and to search across assemblies (e.g. find_implementations). Replaces any previously configured paths. Pass an empty array to clear.")]
     public static string SetSearchPaths(
         DecompilerService decompilerService,
         [Description("Array of full directory paths containing .NET assemblies (e.g. ['C:\\\\app\\\\bin', 'C:\\\\libs'])")] string[] directories)
@@ -56,21 +52,15 @@ public sealed class SearchPathTools
         }
     }
 
-    [McpServerTool(Name = "list_loaded_assemblies"), Description("List all assemblies currently loaded in memory. Assemblies are cached when first accessed by any tool and remain loaded for the session.")]
+    [McpServerTool(Name = "list_loaded_assemblies", Title = "List Loaded Assemblies", ReadOnly = true, OpenWorld = false), Description("List all assemblies currently loaded in memory. Assemblies are cached when first accessed by any tool and remain loaded for the session. Returns a JSON array.")]
     public static string ListLoadedAssemblies(DecompilerService decompilerService)
     {
         var assemblies = decompilerService.GetLoadedAssemblies();
         if (assemblies.Count == 0)
-            return "No assemblies loaded.";
+            return "[]";
 
-        var sb = new StringBuilder();
-        sb.AppendLine($"Loaded assemblies ({assemblies.Count}):");
-        sb.AppendLine();
-        foreach (var asm in assemblies)
-        {
-            sb.AppendLine($"  {asm.Name} v{asm.Version}");
-            sb.AppendLine($"    {asm.Path}");
-        }
-        return sb.ToString();
+        return JsonSerializer.Serialize(
+            assemblies.Select(a => new { a.Name, a.Version, a.Path }),
+            s_jsonOptions);
     }
 }

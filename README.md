@@ -7,7 +7,6 @@ An MCP (Model Context Protocol) server that exposes [ILSpy](https://github.com/i
 | Tool | Description |
 |------|-------------|
 | `decompile_type` | Decompile a specific .NET type to C# source code |
-| `decompile_assembly` | Decompile an entire .NET assembly to C# |
 | `list_types` | List all types in an assembly (with optional namespace filter) |
 | `list_members` | List methods, properties, fields, and events of a type |
 | `get_il` | Get IL disassembly for a type or method |

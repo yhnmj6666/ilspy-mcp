@@ -9,7 +9,7 @@ namespace ILSpyMcp.Tools;
 [McpServerToolType]
 public sealed class ILTools
 {
-    [McpServerTool(Name = "get_il"), Description("Get the IL (Intermediate Language) disassembly for a type or a specific method in a .NET assembly.")]
+    [McpServerTool(Name = "get_il", Title = "Get IL Disassembly", ReadOnly = true, OpenWorld = false), Description("Get the IL (Intermediate Language) disassembly for a type or a specific method in a .NET assembly.")]
     public static string GetIL(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,

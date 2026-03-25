@@ -111,12 +111,6 @@ public class DecompilerService
         return decompiler.DecompileTypeAsString(fullTypeName);
     }
 
-    public string DecompileAssembly(string assemblyPath)
-    {
-        var decompiler = CreateDecompiler(assemblyPath);
-        return decompiler.DecompileWholeModuleAsString();
-    }
-
     public string DecompileMember(string assemblyPath, string typeName, string memberName)
     {
         var peFile = LoadAssembly(assemblyPath);

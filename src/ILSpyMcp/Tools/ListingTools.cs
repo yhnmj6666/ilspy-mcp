@@ -1,5 +1,5 @@
 using System.ComponentModel;
-using System.Text;
+using System.Text.Json;
 
 using ILSpyMcp.Services;
 
@@ -10,7 +10,9 @@ namespace ILSpyMcp.Tools;
 [McpServerToolType]
 public sealed class ListingTools
 {
-    [McpServerTool(Name = "list_types"), Description("List all types defined in a .NET assembly, optionally filtered by namespace.")]
+    private static readonly JsonSerializerOptions s_jsonOptions = new() { WriteIndented = true };
+
+    [McpServerTool(Name = "list_types", Title = "List Types", ReadOnly = true, OpenWorld = false), Description("List all types defined in a .NET assembly, optionally filtered by namespace. Returns a JSON array.")]
     public static string ListTypes(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,
@@ -20,16 +22,11 @@ public sealed class ListingTools
         {
             var types = decompilerService.ListTypes(assemblyPath, namespaceFilter);
             if (types.Count == 0)
-                return "No types found.";
+                return "[]";
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Found {types.Count} type(s):");
-            sb.AppendLine();
-            foreach (var type in types)
-            {
-                sb.AppendLine($"  [{type.Kind}] {type.FullName}");
-            }
-            return sb.ToString();
+            return JsonSerializer.Serialize(
+                types.Select(t => new { t.Kind, t.FullName }),
+                s_jsonOptions);
         }
         catch (Exception ex)
         {
@@ -37,48 +34,33 @@ public sealed class ListingTools
         }
     }
 
-    [McpServerTool(Name = "list_members"), Description("List all members (methods, properties, fields, events) of one or more types in a .NET assembly.")]
+    [McpServerTool(Name = "list_members", Title = "List Members", ReadOnly = true, OpenWorld = false), Description("List all members (methods, properties, fields, events) of one or more types in a .NET assembly. Returns a JSON array.")]
     public static string ListMembers(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,
         [Description("Fully qualified type name(s) (e.g. 'MyNamespace.MyClass'). Pass a single name or an array for batch listing.")] string[] typeNames)
     {
-        var sb = new StringBuilder();
+        var results = new List<object>();
         foreach (var typeName in typeNames)
         {
             try
             {
                 var members = decompilerService.ListMembers(assemblyPath, typeName);
-                sb.AppendLine($"Members of {typeName} ({members.Count} total):");
-                sb.AppendLine();
-
-                if (members.Count == 0)
+                results.Add(new
                 {
-                    sb.AppendLine("  (none)");
-                    sb.AppendLine();
-                    continue;
-                }
-
-                foreach (var group in members.GroupBy(m => m.MemberType))
-                {
-                    sb.AppendLine($"  {group.Key}s:");
-                    foreach (var member in group)
-                    {
-                        sb.AppendLine($"    {member.Signature}");
-                    }
-                    sb.AppendLine();
-                }
+                    TypeName = typeName,
+                    Members = members.Select(m => new { m.MemberType, m.Name, m.Signature })
+                });
             }
             catch (Exception ex)
             {
-                sb.AppendLine($"Members of {typeName}: Error: {ex.Message}");
-                sb.AppendLine();
+                results.Add(new { TypeName = typeName, Error = ex.Message });
             }
         }
-        return sb.ToString();
+        return JsonSerializer.Serialize(results, s_jsonOptions);
     }
 
-    [McpServerTool(Name = "search_types"), Description("Search for types in a .NET assembly by name pattern (case-insensitive substring match).")]
+    [McpServerTool(Name = "search_types", Title = "Search Types", ReadOnly = true, OpenWorld = false), Description("Search for types in a .NET assembly by name pattern (case-insensitive substring match). Returns a JSON array.")]
     public static string SearchTypes(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,
@@ -88,16 +70,11 @@ public sealed class ListingTools
         {
             var types = decompilerService.SearchTypes(assemblyPath, pattern);
             if (types.Count == 0)
-                return $"No types matching '{pattern}' found.";
+                return "[]";
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Found {types.Count} type(s) matching '{pattern}':");
-            sb.AppendLine();
-            foreach (var type in types)
-            {
-                sb.AppendLine($"  [{type.Kind}] {type.FullName}");
-            }
-            return sb.ToString();
+            return JsonSerializer.Serialize(
+                types.Select(t => new { t.Kind, t.FullName }),
+                s_jsonOptions);
         }
         catch (Exception ex)
         {
@@ -105,7 +82,7 @@ public sealed class ListingTools
         }
     }
 
-    [McpServerTool(Name = "search_members"), Description("Search for members (methods, properties, fields, events) by name across all types in a .NET assembly. Case-insensitive substring match.")]
+    [McpServerTool(Name = "search_members", Title = "Search Members", ReadOnly = true, OpenWorld = false), Description("Search for members (methods, properties, fields, events) by name across all types in a .NET assembly. Case-insensitive substring match. Returns a JSON array.")]
     public static string SearchMembers(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,
@@ -115,20 +92,11 @@ public sealed class ListingTools
         {
             var results = decompilerService.SearchMembers(assemblyPath, pattern);
             if (results.Count == 0)
-                return $"No members matching '{pattern}' found.";
+                return "[]";
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Found {results.Count} member(s) matching '{pattern}':");
-            sb.AppendLine();
-            foreach (var group in results.GroupBy(r => r.DeclaringType))
-            {
-                sb.AppendLine($"  {group.Key}:");
-                foreach (var member in group)
-                {
-                    sb.AppendLine($"    [{member.MemberType}] {member.Name}");
-                }
-            }
-            return sb.ToString();
+            return JsonSerializer.Serialize(
+                results.Select(r => new { r.DeclaringType, r.MemberType, r.Name }),
+                s_jsonOptions);
         }
         catch (Exception ex)
         {
@@ -136,7 +104,7 @@ public sealed class ListingTools
         }
     }
 
-    [McpServerTool(Name = "list_namespaces"), Description("List all namespaces defined in a .NET assembly.")]
+    [McpServerTool(Name = "list_namespaces", Title = "List Namespaces", ReadOnly = true, OpenWorld = false), Description("List all namespaces defined in a .NET assembly. Returns a JSON array.")]
     public static string ListNamespaces(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath)
@@ -145,16 +113,9 @@ public sealed class ListingTools
         {
             var namespaces = decompilerService.ListNamespaces(assemblyPath);
             if (namespaces.Count == 0)
-                return "No namespaces found (all types are in the global namespace).";
+                return "[]";
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Found {namespaces.Count} namespace(s):");
-            sb.AppendLine();
-            foreach (var ns in namespaces)
-            {
-                sb.AppendLine($"  {ns}");
-            }
-            return sb.ToString();
+            return JsonSerializer.Serialize(namespaces, s_jsonOptions);
         }
         catch (Exception ex)
         {
@@ -162,7 +123,7 @@ public sealed class ListingTools
         }
     }
 
-    [McpServerTool(Name = "find_implementations"), Description("Find types that implement a specific interface or extend a specific base class. Searches a single assembly, or all assemblies across configured search paths if no assembly is specified.")]
+    [McpServerTool(Name = "find_implementations", Title = "Find Implementations", ReadOnly = true, OpenWorld = false), Description("Find types that implement a specific interface or extend a specific base class. Searches a single assembly, or all assemblies across configured search paths if no assembly is specified. Returns a JSON array.")]
     public static string FindImplementations(
         DecompilerService decompilerService,
         [Description("Base class or interface name to search for (e.g. 'IDisposable', 'Controller')")] string baseOrInterfaceName,
@@ -172,20 +133,11 @@ public sealed class ListingTools
         {
             var types = decompilerService.FindImplementations(assemblyPath, baseOrInterfaceName);
             if (types.Count == 0)
-                return $"No types implementing or extending '{baseOrInterfaceName}' found.";
+                return "[]";
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"Found {types.Count} type(s) implementing/extending '{baseOrInterfaceName}':");
-            sb.AppendLine();
-            foreach (var group in types.GroupBy(t => t.AssemblyName))
-            {
-                sb.AppendLine($"  [{group.Key}]:");
-                foreach (var type in group)
-                {
-                    sb.AppendLine($"    [{type.Kind}] {type.FullName}");
-                }
-            }
-            return sb.ToString();
+            return JsonSerializer.Serialize(
+                types.Select(t => new { t.Kind, t.FullName, Assembly = t.AssemblyName }),
+                s_jsonOptions);
         }
         catch (Exception ex)
         {
