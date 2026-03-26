@@ -63,4 +63,22 @@ public sealed class SearchPathTools
             assemblies.Select(a => new { a.Name, a.Version, a.Path }),
             s_jsonOptions);
     }
+
+    [McpServerTool(Name = "reset_cache", Title = "Reset Assembly Cache", Destructive = true, Idempotent = true, OpenWorld = false), Description("Evict cached assemblies so they are reloaded from disk on next access. Call this after assemblies have been rebuilt. Pass an assembly path to reset a single assembly, or omit to reset all.")]
+    public static string ResetCache(
+        DecompilerService decompilerService,
+        [Description("Optional full path to a specific assembly to evict. If omitted, all cached assemblies are evicted.")] string? assemblyPath = null)
+    {
+        try
+        {
+            var count = decompilerService.ResetCache(assemblyPath);
+            return assemblyPath != null
+                ? (count > 0 ? $"Evicted cached assembly: {assemblyPath}" : $"Assembly was not cached: {assemblyPath}")
+                : $"Evicted {count} cached assembly(ies).";
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
 }

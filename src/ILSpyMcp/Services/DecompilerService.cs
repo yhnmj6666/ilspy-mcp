@@ -88,7 +88,33 @@ public class DecompilerService
         if (!File.Exists(fullPath))
             throw new FileNotFoundException($"Assembly not found: {fullPath}");
 
-        return _peFileCache.GetOrAdd(fullPath, path => new PEFile(path));
+        return _peFileCache.GetOrAdd(fullPath, path =>
+        {
+            var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return new PEFile(path, stream);
+        });
+    }
+
+    public int ResetCache(string? assemblyPath = null)
+    {
+        if (assemblyPath != null)
+        {
+            var fullPath = Path.GetFullPath(assemblyPath);
+            if (_peFileCache.TryRemove(fullPath, out var peFile))
+            {
+                peFile.Dispose();
+                return 1;
+            }
+            return 0;
+        }
+
+        var count = _peFileCache.Count;
+        foreach (var kvp in _peFileCache)
+        {
+            if (_peFileCache.TryRemove(kvp.Key, out var peFile))
+                peFile.Dispose();
+        }
+        return count;
     }
 
     public CSharpDecompiler CreateDecompiler(string assemblyPath, DecompilerSettings? settings = null)
