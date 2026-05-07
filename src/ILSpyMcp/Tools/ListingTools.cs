@@ -60,20 +60,21 @@ public sealed class ListingTools
         return JsonSerializer.Serialize(results, s_jsonOptions);
     }
 
-    [McpServerTool(Name = "search_types", Title = "Search Types", ReadOnly = true, OpenWorld = false), Description("Search for types in a .NET assembly by name pattern (case-insensitive substring match). Returns a JSON array.")]
-    public static string SearchTypes(
+    [McpServerTool(Name = "search_types_and_members", Title = "Search Types and Members", ReadOnly = true, OpenWorld = false), Description("Search for types and members (methods, properties, fields, events) in a .NET assembly by regex pattern. The pattern is a case-insensitive .NET regular expression matched against the type's full name and each member's simple name; it is unanchored, so plain substrings (e.g. 'Controller') work as before. Returns a JSON object with 'Types' and 'Members' arrays.")]
+    public static string SearchTypesAndMembers(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,
-        [Description("Search pattern to match against type names (case-insensitive)")] string pattern)
+        [Description("Case-insensitive .NET regex pattern. Matched against type full names and member simple names. Unanchored, so a plain substring works. Note that '.' matches any character — use '\\.' for a literal dot.")] string pattern)
     {
         try
         {
-            var types = decompilerService.SearchTypes(assemblyPath, pattern);
-            if (types.Count == 0)
-                return "[]";
-
+            var result = decompilerService.SearchTypesAndMembers(assemblyPath, pattern);
             return JsonSerializer.Serialize(
-                types.Select(t => new { t.Kind, t.FullName }),
+                new
+                {
+                    Types = result.Types.Select(t => new { t.Kind, t.FullName }),
+                    Members = result.Members.Select(r => new { r.DeclaringType, r.MemberType, r.Name }),
+                },
                 s_jsonOptions);
         }
         catch (Exception ex)
@@ -82,20 +83,20 @@ public sealed class ListingTools
         }
     }
 
-    [McpServerTool(Name = "search_members", Title = "Search Members", ReadOnly = true, OpenWorld = false), Description("Search for members (methods, properties, fields, events) by name across all types in a .NET assembly. Case-insensitive substring match. Returns a JSON array.")]
-    public static string SearchMembers(
+    [McpServerTool(Name = "search_string", Title = "Search String", ReadOnly = true, OpenWorld = false), Description("Search for string literals in a .NET assembly. Scans IL `ldstr` instructions in every method body, and string-typed default values on fields, parameters, and properties. The pattern is a case-insensitive .NET regex (unanchored, so a plain substring works). Returns a JSON array of { DeclaringType, Member, MemberKind, Value } where MemberKind is one of 'Method' (IL ldstr), 'Field', 'Parameter', or 'Property'. Method members include a parenthesized parameter-type list to disambiguate overloads. Results are deduplicated.")]
+    public static string SearchString(
         DecompilerService decompilerService,
         [Description("Full path to the .NET assembly (.dll or .exe)")] string assemblyPath,
-        [Description("Search pattern to match against member names (case-insensitive)")] string pattern)
+        [Description("Case-insensitive .NET regex pattern matched against each candidate string literal. Unanchored, so a plain substring works. Note that '.' matches any character — use '\\.' for a literal dot.")] string pattern)
     {
         try
         {
-            var results = decompilerService.SearchMembers(assemblyPath, pattern);
+            var results = decompilerService.SearchStrings(assemblyPath, pattern);
             if (results.Count == 0)
                 return "[]";
 
             return JsonSerializer.Serialize(
-                results.Select(r => new { r.DeclaringType, r.MemberType, r.Name }),
+                results.Select(r => new { r.DeclaringType, r.Member, r.MemberKind, r.Value }),
                 s_jsonOptions);
         }
         catch (Exception ex)

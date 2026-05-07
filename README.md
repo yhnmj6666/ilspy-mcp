@@ -10,7 +10,8 @@ An MCP (Model Context Protocol) server that exposes [ILSpy](https://github.com/i
 | `list_types` | List all types in an assembly (with optional namespace filter) |
 | `list_members` | List methods, properties, fields, and events of a type |
 | `get_il` | Get IL disassembly for a type or method |
-| `search_types` | Search for types by name pattern |
+| `search_types_and_members` | Search for types and members by regex pattern (case-insensitive) |
+| `search_string` | Search for string literals (IL `ldstr` and metadata constants) by regex |
 | `get_assembly_info` | Get assembly metadata (name, version, framework, references) |
 
 ## Build

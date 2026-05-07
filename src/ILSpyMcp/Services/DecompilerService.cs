@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
+using System.Text.RegularExpressions;
 
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.CSharp;
@@ -13,6 +15,7 @@ namespace ILSpyMcp.Services;
 public class DecompilerService
 {
     private readonly ConcurrentDictionary<string, PEFile> _peFileCache = new();
+    private readonly ConcurrentDictionary<string, Lazy<IReadOnlyList<StringSearchResult>>> _stringsCache = new();
     private readonly List<string> _searchPaths = new();
     private readonly object _searchPathLock = new();
 
@@ -100,6 +103,7 @@ public class DecompilerService
         if (assemblyPath != null)
         {
             var fullPath = Path.GetFullPath(assemblyPath);
+            _stringsCache.TryRemove(fullPath, out _);
             if (_peFileCache.TryRemove(fullPath, out var peFile))
             {
                 peFile.Dispose();
@@ -108,6 +112,7 @@ public class DecompilerService
             return 0;
         }
 
+        _stringsCache.Clear();
         var count = _peFileCache.Count;
         foreach (var kvp in _peFileCache)
         {
@@ -292,19 +297,27 @@ public class DecompilerService
         return output.ToString();
     }
 
-    public IReadOnlyList<TypeInfo> SearchTypes(string assemblyPath, string pattern)
+    public SearchTypesAndMembersResult SearchTypesAndMembers(string assemblyPath, string pattern)
     {
-        var allTypes = ListTypes(assemblyPath);
-        return allTypes.Where(t =>
-            t.FullName.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-    }
+        // Compile the pattern as a case-insensitive .NET regex with a safety timeout.
+        // The regex is unanchored, so substring queries (e.g. "Controller") still work.
+        Regex regex;
+        try
+        {
+            regex = new Regex(
+                pattern,
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                TimeSpan.FromSeconds(5));
+        }
+        catch (ArgumentException ex)
+        {
+            throw new ArgumentException($"Invalid regex pattern '{pattern}': {ex.Message}", nameof(pattern), ex);
+        }
 
-    public IReadOnlyList<MemberSearchResult> SearchMembers(string assemblyPath, string pattern)
-    {
         var peFile = LoadAssembly(assemblyPath);
         var metadata = peFile.Metadata;
-        var results = new List<MemberSearchResult>();
+        var types = new List<TypeInfo>();
+        var members = new List<MemberSearchResult>();
 
         foreach (var typeDefHandle in metadata.TypeDefinitions)
         {
@@ -316,34 +329,220 @@ public class DecompilerService
             var typeNs = metadata.GetString(typeDef.Namespace);
             var fullTypeName = string.IsNullOrEmpty(typeNs) ? typeName : $"{typeNs}.{typeName}";
 
+            // Match types — skip nested types to mirror ListTypes behavior.
+            if (!typeDef.IsNested && regex.IsMatch(fullTypeName))
+            {
+                types.Add(new TypeInfo(fullTypeName, typeNs, typeName, GetTypeKind(typeDef, metadata)));
+            }
+
             foreach (var h in typeDef.GetMethods())
             {
                 var name = metadata.GetString(metadata.GetMethodDefinition(h).Name);
-                if (name.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                    results.Add(new MemberSearchResult(fullTypeName, "Method", name));
+                if (regex.IsMatch(name))
+                    members.Add(new MemberSearchResult(fullTypeName, "Method", name));
             }
 
             foreach (var h in typeDef.GetProperties())
             {
                 var name = metadata.GetString(metadata.GetPropertyDefinition(h).Name);
-                if (name.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                    results.Add(new MemberSearchResult(fullTypeName, "Property", name));
+                if (regex.IsMatch(name))
+                    members.Add(new MemberSearchResult(fullTypeName, "Property", name));
             }
 
             foreach (var h in typeDef.GetFields())
             {
                 var name = metadata.GetString(metadata.GetFieldDefinition(h).Name);
-                if (name.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                    results.Add(new MemberSearchResult(fullTypeName, "Field", name));
+                if (regex.IsMatch(name))
+                    members.Add(new MemberSearchResult(fullTypeName, "Field", name));
             }
 
             foreach (var h in typeDef.GetEvents())
             {
                 var name = metadata.GetString(metadata.GetEventDefinition(h).Name);
-                if (name.Contains(pattern, StringComparison.OrdinalIgnoreCase))
-                    results.Add(new MemberSearchResult(fullTypeName, "Event", name));
+                if (regex.IsMatch(name))
+                    members.Add(new MemberSearchResult(fullTypeName, "Event", name));
             }
         }
+
+        types.Sort((a, b) => string.CompareOrdinal(a.FullName, b.FullName));
+        members.Sort((a, b) =>
+        {
+            var c = string.CompareOrdinal(a.DeclaringType, b.DeclaringType);
+            return c != 0 ? c : string.CompareOrdinal(a.Name, b.Name);
+        });
+
+        return new SearchTypesAndMembersResult(types, members);
+    }
+
+    public IReadOnlyList<StringSearchResult> SearchStrings(string assemblyPath, string pattern)
+    {
+        Regex regex;
+        try
+        {
+            // Lower per-match timeout than other search tools because we run IsMatch
+            // against potentially thousands of candidate strings per search.
+            regex = new Regex(
+                pattern,
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                TimeSpan.FromSeconds(1));
+        }
+        catch (ArgumentException ex)
+        {
+            throw new ArgumentException($"Invalid regex pattern '{pattern}': {ex.Message}", nameof(pattern), ex);
+        }
+
+        var fullPath = Path.GetFullPath(assemblyPath);
+
+        // Cache the full enumerated string set per assembly so subsequent searches
+        // (typically refining the regex) don't re-walk every method body. We use
+        // Lazy<T> with ExecutionAndPublication so concurrent callers for the same
+        // uncached assembly all wait on a single enumeration instead of racing.
+        var lazy = _stringsCache.GetOrAdd(
+            fullPath,
+            p => new Lazy<IReadOnlyList<StringSearchResult>>(
+                () => EnumerateAllStrings(p),
+                LazyThreadSafetyMode.ExecutionAndPublication));
+
+        IReadOnlyList<StringSearchResult> all;
+        try
+        {
+            all = lazy.Value;
+        }
+        catch
+        {
+            // Don't poison the cache with a failed Lazy. Use the KeyValuePair overload
+            // to atomically remove only the entry we observed (in case another thread
+            // has already inserted a fresh one).
+            _stringsCache.TryRemove(new KeyValuePair<string, Lazy<IReadOnlyList<StringSearchResult>>>(fullPath, lazy));
+            throw;
+        }
+
+        var results = new List<StringSearchResult>();
+        foreach (var s in all)
+        {
+            if (regex.IsMatch(s.Value))
+                results.Add(s);
+        }
+        return results;
+    }
+
+    private IReadOnlyList<StringSearchResult> EnumerateAllStrings(string assemblyPath)
+    {
+        var peFile = LoadAssembly(assemblyPath);
+        var metadata = peFile.Metadata;
+        var sigProvider = new SignatureTypeProvider();
+        var seen = new HashSet<(string Type, string Member, string Kind, string Value)>();
+        var results = new List<StringSearchResult>();
+
+        void TryAdd(string type, string member, string kind, string value)
+        {
+            if (seen.Add((type, member, kind, value)))
+                results.Add(new StringSearchResult(type, member, kind, value));
+        }
+
+        foreach (var typeDefHandle in metadata.TypeDefinitions)
+        {
+            var typeDef = metadata.GetTypeDefinition(typeDefHandle);
+            var typeShortName = metadata.GetString(typeDef.Name);
+            if (typeShortName == "<Module>")
+                continue;
+
+            var fullTypeName = BuildFullTypeName(metadata, typeDef);
+
+            foreach (var methodHandle in typeDef.GetMethods())
+            {
+                var method = metadata.GetMethodDefinition(methodHandle);
+
+                // 1) ldstr literals in the method body.
+                if (method.RelativeVirtualAddress != 0)
+                {
+                    string? methodDisplay = null;
+                    try
+                    {
+                        var body = peFile.Reader.GetMethodBody(method.RelativeVirtualAddress);
+                        var reader = body.GetILReader();
+                        while (reader.RemainingBytes > 0)
+                        {
+                            ILOpCode op;
+                            try { op = ILParser.DecodeOpCode(ref reader); }
+                            catch { break; }
+
+                            if (op == ILOpCode.Ldstr)
+                            {
+                                string? value;
+                                try { value = ILParser.DecodeUserString(ref reader, metadata); }
+                                catch { break; }
+
+                                if (value is not null)
+                                {
+                                    methodDisplay ??= BuildMethodDisplay(metadata, method, sigProvider);
+                                    TryAdd(fullTypeName, methodDisplay, "Method", value);
+                                }
+                            }
+                            else
+                            {
+                                try { ILParser.SkipOperand(ref reader, op); }
+                                catch { break; }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // Unreadable method body — skip silently.
+                    }
+                }
+
+                // 2) String default values on parameters (e.g. void Foo(string x = "y")).
+                var methodNameForParams = metadata.GetString(method.Name);
+                foreach (var paramHandle in method.GetParameters())
+                {
+                    var param = metadata.GetParameter(paramHandle);
+                    if ((param.Attributes & ParameterAttributes.HasDefault) == 0)
+                        continue;
+                    var value = TryReadStringConstant(metadata, param.GetDefaultValue());
+                    if (value is null)
+                        continue;
+                    var paramName = metadata.GetString(param.Name);
+                    var display = string.IsNullOrEmpty(paramName)
+                        ? methodNameForParams
+                        : $"{methodNameForParams}({paramName})";
+                    TryAdd(fullTypeName, display, "Parameter", value);
+                }
+            }
+
+            // 3) String constants on fields (e.g. const string Foo = "bar").
+            foreach (var fieldHandle in typeDef.GetFields())
+            {
+                var field = metadata.GetFieldDefinition(fieldHandle);
+                if ((field.Attributes & FieldAttributes.HasDefault) == 0)
+                    continue;
+                var value = TryReadStringConstant(metadata, field.GetDefaultValue());
+                if (value is null)
+                    continue;
+                TryAdd(fullTypeName, metadata.GetString(field.Name), "Field", value);
+            }
+
+            // 4) String defaults on properties (rare, but legal in metadata).
+            foreach (var propHandle in typeDef.GetProperties())
+            {
+                var prop = metadata.GetPropertyDefinition(propHandle);
+                if ((prop.Attributes & PropertyAttributes.HasDefault) == 0)
+                    continue;
+                var value = TryReadStringConstant(metadata, prop.GetDefaultValue());
+                if (value is null)
+                    continue;
+                TryAdd(fullTypeName, metadata.GetString(prop.Name), "Property", value);
+            }
+        }
+
+        results.Sort((a, b) =>
+        {
+            var c = string.CompareOrdinal(a.DeclaringType, b.DeclaringType);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.Member, b.Member);
+            if (c != 0) return c;
+            return string.CompareOrdinal(a.Value, b.Value);
+        });
 
         return results;
     }
@@ -558,10 +757,70 @@ public class DecompilerService
         return default;
     }
 
+    private static string BuildFullTypeName(MetadataReader metadata, TypeDefinition typeDef)
+    {
+        if (!typeDef.IsNested)
+        {
+            var name = metadata.GetString(typeDef.Name);
+            var ns = metadata.GetString(typeDef.Namespace);
+            return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+        }
+
+        var parts = new List<string>();
+        var current = typeDef;
+        while (true)
+        {
+            parts.Add(metadata.GetString(current.Name));
+            if (!current.IsNested)
+            {
+                var ns = metadata.GetString(current.Namespace);
+                if (!string.IsNullOrEmpty(ns))
+                    parts.Add(ns);
+                break;
+            }
+            current = metadata.GetTypeDefinition(current.GetDeclaringType());
+        }
+        parts.Reverse();
+        return string.Join(".", parts);
+    }
+
+    private static string BuildMethodDisplay(MetadataReader metadata, MethodDefinition method, SignatureTypeProvider provider)
+    {
+        var name = metadata.GetString(method.Name);
+        try
+        {
+            var sig = method.DecodeSignature(provider, default);
+            return $"{name}({string.Join(", ", sig.ParameterTypes)})";
+        }
+        catch
+        {
+            return name;
+        }
+    }
+
+    private static string? TryReadStringConstant(MetadataReader metadata, ConstantHandle handle)
+    {
+        if (handle.IsNil)
+            return null;
+        try
+        {
+            var constant = metadata.GetConstant(handle);
+            if (constant.TypeCode != ConstantTypeCode.String || constant.Value.IsNil)
+                return null;
+            var blob = metadata.GetBlobReader(constant.Value);
+            return blob.ReadUTF16(blob.Length);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static string GetTypeKind(TypeDefinition typeDef, MetadataReader metadata)
     {
         if ((typeDef.Attributes & System.Reflection.TypeAttributes.Interface) != 0)
             return "interface";
+
         if ((typeDef.Attributes & System.Reflection.TypeAttributes.Sealed) != 0 &&
             (typeDef.Attributes & System.Reflection.TypeAttributes.Abstract) != 0)
             return "static class";
@@ -640,6 +899,8 @@ internal class SignatureTypeProvider : ISignatureTypeProvider<string, object?>
 public record TypeInfo(string FullName, string Namespace, string Name, string Kind);
 public record MemberInfo(string MemberType, string Name, string Signature);
 public record MemberSearchResult(string DeclaringType, string MemberType, string Name);
+public record SearchTypesAndMembersResult(IReadOnlyList<TypeInfo> Types, IReadOnlyList<MemberSearchResult> Members);
+public record StringSearchResult(string DeclaringType, string Member, string MemberKind, string Value);
 public record ImplementationInfo(string FullName, string Namespace, string Name, string Kind, string AssemblyName, string AssemblyPath);
 public record LoadedAssemblyInfo(string Name, string Version, string Path);
 public record AssemblyReferenceInfo(string Name, string Version, string? PublicKeyToken, string? ResolvedPath);
