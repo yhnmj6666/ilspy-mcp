@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Collections.Immutable;
 using System.Reflection;
 using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Text.RegularExpressions;
 
@@ -666,6 +668,94 @@ public class DecompilerService
         }
     }
 
+    public FindReferencesOutcome FindReferences(
+        string targetAssembly,
+        string typeName,
+        string? memberName,
+        string memberKind,
+        string? scopeAssembly)
+    {
+        memberKind = (memberKind ?? "any").Trim().ToLowerInvariant();
+        if (memberKind is not ("method" or "field" or "property" or "event" or "type" or "any"))
+            throw new ArgumentException(
+                $"Invalid memberKind '{memberKind}'. Expected one of: method, field, property, event, type, any.",
+                nameof(memberKind));
+
+        if (memberKind != "type" && string.IsNullOrEmpty(memberName))
+            throw new ArgumentException(
+                "memberName is required unless memberKind is 'type'.",
+                nameof(memberName));
+
+        var targetAsmFullPath = Path.GetFullPath(targetAssembly);
+        var targetPeFile = LoadAssembly(targetAsmFullPath);
+        var targetMetadata = targetPeFile.Metadata;
+        var targetAsmName = SafeGetAssemblySimpleName(targetMetadata, targetAsmFullPath);
+
+        var targets = ResolveReferenceTargets(targetMetadata, targetAsmName, typeName, memberName, memberKind);
+        if (targets.Count == 0)
+        {
+            var kindLabel = memberKind == "any" ? "member" : memberKind;
+            throw new ArgumentException(
+                $"No {kindLabel} matching '{typeName}.{memberName}' found in '{Path.GetFileName(targetAsmFullPath)}'.");
+        }
+
+        var scopePaths = new List<string>();
+        if (!string.IsNullOrEmpty(scopeAssembly))
+        {
+            scopePaths.Add(Path.GetFullPath(scopeAssembly));
+        }
+        else
+        {
+            scopePaths.Add(targetAsmFullPath);
+            foreach (var asm in GetAssembliesInSearchPaths())
+            {
+                if (!string.Equals(asm, targetAsmFullPath, StringComparison.OrdinalIgnoreCase))
+                    scopePaths.Add(asm);
+            }
+        }
+
+        var targetAsmNamesSet = new HashSet<string>(
+            targets.Select(t => t.AssemblySimpleName),
+            StringComparer.OrdinalIgnoreCase);
+
+        var results = new List<FindReferenceHit>();
+        var scannedAssemblies = new List<string>();
+        var skippedAssemblies = new List<string>();
+
+        foreach (var asmPath in scopePaths)
+        {
+            try
+            {
+                var hits = ScanAssemblyForReferences(asmPath, targets, targetAsmNamesSet);
+                results.AddRange(hits);
+                scannedAssemblies.Add(Path.GetFileName(asmPath));
+            }
+            catch
+            {
+                skippedAssemblies.Add(Path.GetFileName(asmPath));
+            }
+        }
+
+        results.Sort((a, b) =>
+        {
+            var c = string.CompareOrdinal(a.Assembly, b.Assembly);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.DeclaringType, b.DeclaringType);
+            if (c != 0) return c;
+            return string.CompareOrdinal(a.Member, b.Member);
+        });
+
+        var resolvedTargetSummaries = targets
+            .Select(t => new ResolvedTargetSummary(
+                t.AssemblySimpleName,
+                t.TypeFullName,
+                t.MemberName ?? "",
+                MatchKindLabel(t.Kind)))
+            .ToList();
+
+        return new FindReferencesOutcome(resolvedTargetSummaries, scannedAssemblies, skippedAssemblies, results);
+    }
+
     public AssemblyInfo GetAssemblyInfo(string assemblyPath)
     {
         var peFile = LoadAssembly(assemblyPath);
@@ -846,7 +936,540 @@ public class DecompilerService
 
         return "class";
     }
+
+    private static string SafeGetAssemblySimpleName(MetadataReader metadata, string fallbackPath)
+    {
+        try
+        {
+            return metadata.GetString(metadata.GetAssemblyDefinition().Name);
+        }
+        catch
+        {
+            return Path.GetFileNameWithoutExtension(fallbackPath);
+        }
+    }
+
+    private static string MatchKindLabel(ReferenceTargetKind kind) => kind switch
+    {
+        ReferenceTargetKind.Method => "method",
+        ReferenceTargetKind.Field => "field",
+        ReferenceTargetKind.Type => "type",
+        _ => kind.ToString().ToLowerInvariant()
+    };
+
+    private static IReadOnlyList<ReferenceTargetDescriptor> ResolveReferenceTargets(
+        MetadataReader metadata,
+        string assemblyName,
+        string typeName,
+        string? memberName,
+        string memberKind)
+    {
+        var typeHandle = FindTypeDefinition(metadata, typeName);
+        if (typeHandle.IsNil)
+            throw new ArgumentException($"Type '{typeName}' not found in target assembly.");
+
+        var typeDef = metadata.GetTypeDefinition(typeHandle);
+        var fullTypeName = BuildFullTypeName(metadata, typeDef);
+        var descriptors = new List<ReferenceTargetDescriptor>();
+
+        bool tryMethod = memberKind is "method" or "any";
+        bool tryField = memberKind is "field" or "any";
+        bool tryProperty = memberKind is "property" or "any";
+        bool tryEvent = memberKind is "event" or "any";
+        bool tryType = memberKind == "type";
+
+        if (tryType)
+        {
+            descriptors.Add(new ReferenceTargetDescriptor(
+                assemblyName, fullTypeName, null, ReferenceTargetKind.Type));
+        }
+
+        if (tryMethod && memberName != null)
+        {
+            foreach (var mh in typeDef.GetMethods())
+            {
+                if (metadata.GetString(metadata.GetMethodDefinition(mh).Name) == memberName)
+                {
+                    descriptors.Add(new ReferenceTargetDescriptor(
+                        assemblyName, fullTypeName, memberName, ReferenceTargetKind.Method));
+                    break; // one descriptor matches all overloads with this name
+                }
+            }
+        }
+
+        if (tryField && memberName != null)
+        {
+            foreach (var fh in typeDef.GetFields())
+            {
+                if (metadata.GetString(metadata.GetFieldDefinition(fh).Name) == memberName)
+                {
+                    descriptors.Add(new ReferenceTargetDescriptor(
+                        assemblyName, fullTypeName, memberName, ReferenceTargetKind.Field));
+                    break;
+                }
+            }
+        }
+
+        if (tryProperty && memberName != null)
+        {
+            foreach (var ph in typeDef.GetProperties())
+            {
+                var prop = metadata.GetPropertyDefinition(ph);
+                if (metadata.GetString(prop.Name) != memberName) continue;
+                var accessors = prop.GetAccessors();
+                if (!accessors.Getter.IsNil)
+                    descriptors.Add(new ReferenceTargetDescriptor(
+                        assemblyName, fullTypeName, $"get_{memberName}", ReferenceTargetKind.Method));
+                if (!accessors.Setter.IsNil)
+                    descriptors.Add(new ReferenceTargetDescriptor(
+                        assemblyName, fullTypeName, $"set_{memberName}", ReferenceTargetKind.Method));
+            }
+        }
+
+        if (tryEvent && memberName != null)
+        {
+            foreach (var eh in typeDef.GetEvents())
+            {
+                var ev = metadata.GetEventDefinition(eh);
+                if (metadata.GetString(ev.Name) != memberName) continue;
+                var accessors = ev.GetAccessors();
+                if (!accessors.Adder.IsNil)
+                    descriptors.Add(new ReferenceTargetDescriptor(
+                        assemblyName, fullTypeName, $"add_{memberName}", ReferenceTargetKind.Method));
+                if (!accessors.Remover.IsNil)
+                    descriptors.Add(new ReferenceTargetDescriptor(
+                        assemblyName, fullTypeName, $"remove_{memberName}", ReferenceTargetKind.Method));
+                if (!accessors.Raiser.IsNil)
+                    descriptors.Add(new ReferenceTargetDescriptor(
+                        assemblyName, fullTypeName, $"raise_{memberName}", ReferenceTargetKind.Method));
+            }
+        }
+
+        return descriptors.Distinct().ToList();
+    }
+
+    private IReadOnlyList<FindReferenceHit> ScanAssemblyForReferences(
+        string assemblyPath,
+        IReadOnlyList<ReferenceTargetDescriptor> targets,
+        HashSet<string> targetAssemblyNames)
+    {
+        var peFile = LoadAssembly(assemblyPath);
+        var metadata = peFile.Metadata;
+        var thisAsmName = SafeGetAssemblySimpleName(metadata, assemblyPath);
+        var asmFileName = Path.GetFileName(assemblyPath);
+        var sigProvider = new SignatureTypeProvider();
+
+        // Pre-filter: only scan if this assembly is the target itself, or references one of the target assemblies.
+        bool referencesTarget = targetAssemblyNames.Contains(thisAsmName);
+        if (!referencesTarget)
+        {
+            foreach (var refHandle in metadata.AssemblyReferences)
+            {
+                var refName = metadata.GetString(metadata.GetAssemblyReference(refHandle).Name);
+                if (targetAssemblyNames.Contains(refName))
+                {
+                    referencesTarget = true;
+                    break;
+                }
+            }
+        }
+        if (!referencesTarget)
+            return Array.Empty<FindReferenceHit>();
+
+        // Index targets for fast lookup: by (typeFullName, memberName, kind) and by type-only key for type targets.
+        var memberLookup = new Dictionary<(string Asm, string Type, string Member, ReferenceTargetKind Kind), bool>(
+            new TargetKeyComparer());
+        var typeOnlyLookup = new HashSet<(string Asm, string Type)>(new TypeKeyComparer());
+        foreach (var t in targets)
+        {
+            if (t.Kind == ReferenceTargetKind.Type)
+                typeOnlyLookup.Add((t.AssemblySimpleName, t.TypeFullName));
+            else if (t.MemberName != null)
+                memberLookup[(t.AssemblySimpleName, t.TypeFullName, t.MemberName, t.Kind)] = true;
+        }
+
+        var hits = new List<FindReferenceHit>();
+
+        foreach (var typeDefHandle in metadata.TypeDefinitions)
+        {
+            TypeDefinition typeDef;
+            try { typeDef = metadata.GetTypeDefinition(typeDefHandle); }
+            catch { continue; }
+
+            var typeShortName = metadata.GetString(typeDef.Name);
+            if (typeShortName == "<Module>") continue;
+
+            var enclosingTypeFullName = BuildFullTypeName(metadata, typeDef);
+
+            foreach (var methodHandle in typeDef.GetMethods())
+            {
+                MethodDefinition method;
+                try { method = metadata.GetMethodDefinition(methodHandle); }
+                catch { continue; }
+                if (method.RelativeVirtualAddress == 0) continue;
+
+                var sites = new List<ReferenceSite>();
+                var distinctOpcodes = new SortedSet<string>(StringComparer.Ordinal);
+                var matchedTargets = new HashSet<(string Kind, string Type, string Name)>();
+
+                try
+                {
+                    var body = peFile.Reader.GetMethodBody(method.RelativeVirtualAddress);
+                    var reader = body.GetILReader();
+                    while (reader.RemainingBytes > 0)
+                    {
+                        int instructionStart = reader.Offset;
+                        ILOpCode op;
+                        try { op = ILParser.DecodeOpCode(ref reader); }
+                        catch { break; }
+
+                        var opKind = ClassifyOpCode(op);
+                        if (opKind == OpCodeOperandKind.MemberToken ||
+                            opKind == OpCodeOperandKind.TypeToken ||
+                            opKind == OpCodeOperandKind.AnyToken)
+                        {
+                            int tokenInt;
+                            try { tokenInt = reader.ReadInt32(); }
+                            catch { break; }
+
+                            try
+                            {
+                                EntityHandle entityHandle;
+                                try { entityHandle = MetadataTokens.EntityHandle(tokenInt); }
+                                catch { continue; }
+
+                                var resolved = TryResolveReference(entityHandle, metadata, thisAsmName);
+                                if (resolved is null) continue;
+
+                                bool memberMatch = false;
+                                bool typeMatch = false;
+
+                                if (resolved.Value.Kind == ReferenceTargetKind.Type)
+                                {
+                                    if (typeOnlyLookup.Contains((resolved.Value.AssemblyName, resolved.Value.TypeFullName)))
+                                        typeMatch = true;
+                                }
+                                else
+                                {
+                                    var key = (resolved.Value.AssemblyName, resolved.Value.TypeFullName,
+                                        resolved.Value.MemberName ?? "", resolved.Value.Kind);
+                                    if (memberLookup.ContainsKey(key))
+                                        memberMatch = true;
+
+                                    // Member references also imply a reference to the parent type.
+                                    if (typeOnlyLookup.Contains((resolved.Value.AssemblyName, resolved.Value.TypeFullName)))
+                                        typeMatch = true;
+                                }
+
+                                if (memberMatch || typeMatch)
+                                {
+                                    var mnemonic = OpCodeMnemonic(op);
+                                    var displayMember = resolved.Value.Kind == ReferenceTargetKind.Type
+                                        ? ""
+                                        : resolved.Value.MemberName ?? "";
+                                    var targetDisplay = string.IsNullOrEmpty(displayMember)
+                                        ? resolved.Value.TypeFullName
+                                        : $"{resolved.Value.TypeFullName}.{displayMember}";
+                                    sites.Add(new ReferenceSite(instructionStart, mnemonic, targetDisplay));
+                                    distinctOpcodes.Add(mnemonic);
+                                    if (memberMatch)
+                                        matchedTargets.Add((MatchKindLabel(resolved.Value.Kind), resolved.Value.TypeFullName, displayMember));
+                                    if (typeMatch)
+                                        matchedTargets.Add((MatchKindLabel(ReferenceTargetKind.Type), resolved.Value.TypeFullName, ""));
+                                }
+                            }
+                            catch
+                            {
+                                // Per-instruction safety: ignore malformed token resolution.
+                            }
+                        }
+                        else
+                        {
+                            try { ILParser.SkipOperand(ref reader, op); }
+                            catch { break; }
+                        }
+                    }
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (sites.Count > 0)
+                {
+                    hits.Add(new FindReferenceHit(
+                        asmFileName,
+                        enclosingTypeFullName,
+                        BuildMethodDisplay(metadata, method, sigProvider),
+                        distinctOpcodes.ToList(),
+                        matchedTargets
+                            .OrderBy(t => t.Type, StringComparer.Ordinal)
+                            .ThenBy(t => t.Name, StringComparer.Ordinal)
+                            .Select(t => new MatchedTargetInfo(t.Kind, t.Type, t.Name))
+                            .ToList(),
+                        sites));
+                }
+            }
+        }
+
+        return hits;
+    }
+
+    private static OpCodeOperandKind ClassifyOpCode(ILOpCode op) => op switch
+    {
+        ILOpCode.Call or ILOpCode.Callvirt or ILOpCode.Newobj or ILOpCode.Jmp or ILOpCode.Ldftn or ILOpCode.Ldvirtftn
+            => OpCodeOperandKind.MemberToken,
+        ILOpCode.Ldfld or ILOpCode.Ldflda or ILOpCode.Stfld or ILOpCode.Ldsfld or ILOpCode.Ldsflda or ILOpCode.Stsfld
+            => OpCodeOperandKind.MemberToken,
+        ILOpCode.Castclass or ILOpCode.Isinst or ILOpCode.Box or ILOpCode.Unbox or ILOpCode.Unbox_any
+            or ILOpCode.Newarr or ILOpCode.Initobj or ILOpCode.Ldobj or ILOpCode.Stobj or ILOpCode.Cpobj
+            or ILOpCode.Mkrefany or ILOpCode.Refanyval or ILOpCode.Sizeof
+            or ILOpCode.Ldelem or ILOpCode.Stelem or ILOpCode.Ldelema or ILOpCode.Constrained
+            => OpCodeOperandKind.TypeToken,
+        ILOpCode.Ldtoken => OpCodeOperandKind.AnyToken,
+        _ => OpCodeOperandKind.Other
+    };
+
+    private static string OpCodeMnemonic(ILOpCode op) => op switch
+    {
+        ILOpCode.Unbox_any => "unbox.any",
+        ILOpCode.Constrained => "constrained.",
+        _ => op.ToString().ToLowerInvariant()
+    };
+
+    private static (ReferenceTargetKind Kind, string AssemblyName, string TypeFullName, string? MemberName)?
+        TryResolveReference(EntityHandle handle, MetadataReader metadata, string thisAsmName)
+    {
+        switch (handle.Kind)
+        {
+            case HandleKind.MethodDefinition:
+            {
+                var md = metadata.GetMethodDefinition((MethodDefinitionHandle)handle);
+                var declType = metadata.GetTypeDefinition(md.GetDeclaringType());
+                return (ReferenceTargetKind.Method, thisAsmName,
+                    BuildFullTypeName(metadata, declType), metadata.GetString(md.Name));
+            }
+            case HandleKind.FieldDefinition:
+            {
+                var fd = metadata.GetFieldDefinition((FieldDefinitionHandle)handle);
+                var declType = metadata.GetTypeDefinition(fd.GetDeclaringType());
+                return (ReferenceTargetKind.Field, thisAsmName,
+                    BuildFullTypeName(metadata, declType), metadata.GetString(fd.Name));
+            }
+            case HandleKind.MemberReference:
+            {
+                var mr = metadata.GetMemberReference((MemberReferenceHandle)handle);
+                var name = metadata.GetString(mr.Name);
+                var (parentAsm, parentTypeFullName) = ResolveTypeEntity(mr.Parent, metadata, thisAsmName);
+                if (parentTypeFullName is null) return null;
+                var kind = mr.GetKind() == MemberReferenceKind.Method
+                    ? ReferenceTargetKind.Method
+                    : ReferenceTargetKind.Field;
+                return (kind, parentAsm ?? thisAsmName, parentTypeFullName, name);
+            }
+            case HandleKind.MethodSpecification:
+            {
+                var ms = metadata.GetMethodSpecification((MethodSpecificationHandle)handle);
+                return TryResolveReference(ms.Method, metadata, thisAsmName);
+            }
+            case HandleKind.TypeDefinition:
+            case HandleKind.TypeReference:
+            case HandleKind.TypeSpecification:
+            {
+                var (asm, typeName) = ResolveTypeEntity(handle, metadata, thisAsmName);
+                if (typeName is null) return null;
+                return (ReferenceTargetKind.Type, asm ?? thisAsmName, typeName, null);
+            }
+            default:
+                return null;
+        }
+    }
+
+    private static (string? Assembly, string? FullName) ResolveTypeEntity(
+        EntityHandle handle, MetadataReader metadata, string thisAsmName)
+    {
+        switch (handle.Kind)
+        {
+            case HandleKind.TypeDefinition:
+            {
+                var td = metadata.GetTypeDefinition((TypeDefinitionHandle)handle);
+                return (null, BuildFullTypeName(metadata, td));
+            }
+            case HandleKind.TypeReference:
+            {
+                return BuildTypeRefIdentity(metadata, (TypeReferenceHandle)handle);
+            }
+            case HandleKind.TypeSpecification:
+            {
+                try
+                {
+                    var ts = metadata.GetTypeSpecification((TypeSpecificationHandle)handle);
+                    var info = ts.DecodeSignature(new TypeIdentityProvider(), null);
+                    return (info.AssemblyName, info.FullName);
+                }
+                catch
+                {
+                    return (null, null);
+                }
+            }
+            default:
+                return (null, null);
+        }
+    }
+
+    internal static (string? Assembly, string FullName) BuildTypeRefIdentity(
+        MetadataReader metadata, TypeReferenceHandle handle)
+    {
+        var typeRef = metadata.GetTypeReference(handle);
+        var name = metadata.GetString(typeRef.Name);
+        var ns = metadata.GetString(typeRef.Namespace);
+        var scope = typeRef.ResolutionScope;
+
+        if (scope.IsNil)
+            return (null, string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}");
+
+        switch (scope.Kind)
+        {
+            case HandleKind.TypeReference:
+            {
+                var (outerAsm, outerName) = BuildTypeRefIdentity(metadata, (TypeReferenceHandle)scope);
+                return (outerAsm, $"{outerName}.{name}");
+            }
+            case HandleKind.AssemblyReference:
+            {
+                var asmRef = metadata.GetAssemblyReference((AssemblyReferenceHandle)scope);
+                return (metadata.GetString(asmRef.Name),
+                    string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}");
+            }
+            default:
+                return (null, string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}");
+        }
+    }
 }
+
+internal enum ReferenceTargetKind { Method, Field, Type }
+internal enum OpCodeOperandKind { Other, MemberToken, TypeToken, AnyToken }
+
+internal record ReferenceTargetDescriptor(
+    string AssemblySimpleName, string TypeFullName, string? MemberName, ReferenceTargetKind Kind);
+
+internal sealed class TargetKeyComparer : IEqualityComparer<(string Asm, string Type, string Member, ReferenceTargetKind Kind)>
+{
+    public bool Equals((string Asm, string Type, string Member, ReferenceTargetKind Kind) x, (string Asm, string Type, string Member, ReferenceTargetKind Kind) y) =>
+        StringComparer.OrdinalIgnoreCase.Equals(x.Asm, y.Asm) &&
+        StringComparer.Ordinal.Equals(x.Type, y.Type) &&
+        StringComparer.Ordinal.Equals(x.Member, y.Member) &&
+        x.Kind == y.Kind;
+
+    public int GetHashCode((string Asm, string Type, string Member, ReferenceTargetKind Kind) obj) =>
+        HashCode.Combine(
+            StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Asm),
+            StringComparer.Ordinal.GetHashCode(obj.Type),
+            StringComparer.Ordinal.GetHashCode(obj.Member),
+            obj.Kind);
+}
+
+internal sealed class TypeKeyComparer : IEqualityComparer<(string Asm, string Type)>
+{
+    public bool Equals((string Asm, string Type) x, (string Asm, string Type) y) =>
+        StringComparer.OrdinalIgnoreCase.Equals(x.Asm, y.Asm) &&
+        StringComparer.Ordinal.Equals(x.Type, y.Type);
+
+    public int GetHashCode((string Asm, string Type) obj) =>
+        HashCode.Combine(
+            StringComparer.OrdinalIgnoreCase.GetHashCode(obj.Asm),
+            StringComparer.Ordinal.GetHashCode(obj.Type));
+}
+
+// Decodes a TypeSpecification signature into a canonical identity for cross-reference matching.
+// For instantiated generics (e.g. List<int>), returns the open-generic identity (e.g. List`1) so
+// that callers can match references regardless of the generic arguments at the call site.
+internal class TypeIdentityProvider : ISignatureTypeProvider<TypeIdentity, object?>
+{
+    public TypeIdentity GetArrayType(TypeIdentity elementType, ArrayShape shape) =>
+        elementType with { FullName = elementType.FullName + "[]" };
+    public TypeIdentity GetByReferenceType(TypeIdentity elementType) => elementType;
+    public TypeIdentity GetFunctionPointerType(MethodSignature<TypeIdentity> signature) =>
+        new("delegate*", null);
+    public TypeIdentity GetGenericInstantiation(TypeIdentity genericType, ImmutableArray<TypeIdentity> typeArguments) =>
+        genericType;
+    public TypeIdentity GetGenericMethodParameter(object? genericContext, int index) =>
+        new($"!!{index}", null);
+    public TypeIdentity GetGenericTypeParameter(object? genericContext, int index) =>
+        new($"!{index}", null);
+    public TypeIdentity GetModifiedType(TypeIdentity modifier, TypeIdentity unmodifiedType, bool isRequired) =>
+        unmodifiedType;
+    public TypeIdentity GetPinnedType(TypeIdentity elementType) => elementType;
+    public TypeIdentity GetPointerType(TypeIdentity elementType) =>
+        elementType with { FullName = elementType.FullName + "*" };
+    public TypeIdentity GetPrimitiveType(PrimitiveTypeCode typeCode) => new(typeCode switch
+    {
+        PrimitiveTypeCode.Void => "System.Void",
+        PrimitiveTypeCode.Boolean => "System.Boolean",
+        PrimitiveTypeCode.Byte => "System.Byte",
+        PrimitiveTypeCode.SByte => "System.SByte",
+        PrimitiveTypeCode.Char => "System.Char",
+        PrimitiveTypeCode.Int16 => "System.Int16",
+        PrimitiveTypeCode.UInt16 => "System.UInt16",
+        PrimitiveTypeCode.Int32 => "System.Int32",
+        PrimitiveTypeCode.UInt32 => "System.UInt32",
+        PrimitiveTypeCode.Int64 => "System.Int64",
+        PrimitiveTypeCode.UInt64 => "System.UInt64",
+        PrimitiveTypeCode.Single => "System.Single",
+        PrimitiveTypeCode.Double => "System.Double",
+        PrimitiveTypeCode.String => "System.String",
+        PrimitiveTypeCode.Object => "System.Object",
+        PrimitiveTypeCode.IntPtr => "System.IntPtr",
+        PrimitiveTypeCode.UIntPtr => "System.UIntPtr",
+        PrimitiveTypeCode.TypedReference => "System.TypedReference",
+        _ => typeCode.ToString()
+    }, null);
+    public TypeIdentity GetSZArrayType(TypeIdentity elementType) =>
+        elementType with { FullName = elementType.FullName + "[]" };
+    public TypeIdentity GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind)
+    {
+        var td = reader.GetTypeDefinition(handle);
+        return new TypeIdentity(BuildDefName(reader, td), null);
+    }
+    public TypeIdentity GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind)
+    {
+        var (asm, name) = DecompilerService.BuildTypeRefIdentity(reader, handle);
+        return new TypeIdentity(name, asm);
+    }
+    public TypeIdentity GetTypeFromSpecification(MetadataReader reader, object? genericContext, TypeSpecificationHandle handle, byte rawTypeKind)
+    {
+        var ts = reader.GetTypeSpecification(handle);
+        return ts.DecodeSignature(this, genericContext);
+    }
+
+    private static string BuildDefName(MetadataReader reader, TypeDefinition typeDef)
+    {
+        if (!typeDef.IsNested)
+        {
+            var name = reader.GetString(typeDef.Name);
+            var ns = reader.GetString(typeDef.Namespace);
+            return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+        }
+
+        var parts = new List<string>();
+        var current = typeDef;
+        while (true)
+        {
+            parts.Add(reader.GetString(current.Name));
+            if (!current.IsNested)
+            {
+                var ns = reader.GetString(current.Namespace);
+                if (!string.IsNullOrEmpty(ns)) parts.Add(ns);
+                break;
+            }
+            current = reader.GetTypeDefinition(current.GetDeclaringType());
+        }
+        parts.Reverse();
+        return string.Join(".", parts);
+    }
+}
+
+internal record TypeIdentity(string FullName, string? AssemblyName);
 
 // Simple signature decoder for display purposes
 internal class SignatureTypeProvider : ISignatureTypeProvider<string, object?>
@@ -908,3 +1531,19 @@ public record AssemblyInfo(
     string Name, string Version, string Culture,
     string? PublicKeyToken, string? TargetFramework, string PEKind,
     IReadOnlyList<AssemblyReferenceInfo> References);
+
+public record FindReferencesOutcome(
+    IReadOnlyList<ResolvedTargetSummary> ResolvedTargets,
+    IReadOnlyList<string> ScannedAssemblies,
+    IReadOnlyList<string> SkippedAssemblies,
+    IReadOnlyList<FindReferenceHit> Hits);
+public record ResolvedTargetSummary(string Assembly, string DeclaringType, string MemberName, string Kind);
+public record MatchedTargetInfo(string Kind, string DeclaringType, string Name);
+public record ReferenceSite(int ILOffset, string Opcode, string Target);
+public record FindReferenceHit(
+    string Assembly,
+    string DeclaringType,
+    string Member,
+    IReadOnlyList<string> Kinds,
+    IReadOnlyList<MatchedTargetInfo> MatchedTargets,
+    IReadOnlyList<ReferenceSite> Sites);
